@@ -915,7 +915,8 @@ impl<A: App> Runner<A> {
                 }
                 let opts = WindowOptions { title: fb.window_title(), app_id: self.w.app_id.clone(), size: (640, 440), fixed: false, min_size: Some((480, 320)) };
                 let id = 0x2000_0000 | pid;
-                let mut win = self.shells.open_with(&self.qh, id, &opts, true);
+                // A window of its own, with the Glove's title bar (not a sheet glued to the app).
+                let mut win = self.shells.open_with(&self.qh, id, &opts, false);
                 win.window.set_parent(Some(&self.w.window));
                 win.window.commit();
                 win.mem.app_icon = self.w.mem.app_icon;
