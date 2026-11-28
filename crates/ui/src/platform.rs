@@ -1,12 +1,14 @@
 //! Janela Wayland do kit: escala fracionada (nítido em 1.5×), mouse, teclado,
 //! e redesenho só quando há evento (zero CPU parado).
 
+use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 use glove_paint::{draw::Canvas, Fonts, Theme, Variant};
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
+    compositor::{CompositorHandler, CompositorState, Region},
+    subcompositor::SubcompositorState,
     data_device_manager::{
         data_device::{DataDevice, DataDeviceHandler},
         data_offer::{DataOfferHandler, DragOffer},
@@ -233,6 +235,8 @@ struct Win {
     app_id: String,
     /// Janela de alerta aberta pelo glove-ui (não pelo app): (janela dona, o alerta).
     alert_of: Option<(u32, crate::ui::AlertReq)>,
+    /// The tiles of the scrolling layers shown by the GPU (by tile).
+    tiles: HashMap<u64, TileSurf>,
     /// Open or Save in a window of its own (opened by glove-ui): (owner, request, browser).
     file_of: Option<(u32, u64, crate::filebrowser::FileBrowser)>,
 }
@@ -273,6 +277,27 @@ struct Shells {
     xdg: XdgShell,
     frac_mgr: Option<WpFractionalScaleManagerV1>,
     viewporter: Option<WpViewporter>,
+    /// Surfaces inside the window (the tiles of the scrolling layers, placed by the GPU).
+    sub: Option<SubcompositorState>,
+}
+
+/// A tile of a scrolling layer shown by the GPU: a surface under the window, cropped to the
+/// part that shows (`wp_viewport`). Scrolling only moves it.
+struct TileSurf {
+    surface: wl_surface::WlSurface,
+    sub: smithay_client_toolkit::reexports::client::protocol::wl_subsurface::WlSubsurface,
+    viewport: WpViewport,
+    buffer: Option<Buffer>,
+    version: u64,
+    place: Option<(i32, i32, i32, i32, i32)>,
+}
+
+impl Drop for TileSurf {
+    fn drop(&mut self) {
+        self.viewport.destroy();
+        self.sub.destroy();
+        self.surface.destroy();
+    }
 }
 
 impl Shells {
@@ -308,6 +333,7 @@ impl Shells {
         mem.alert_native = crate::ui::native_menus() && std::env::var_os("GLOVE_ALERT_SHEET").is_none();
         // GLOVE_FILE_SHEET=1: Open and Save as a sheet inside the window (the old way).
         mem.file_native = mem.alert_native && std::env::var_os("GLOVE_FILE_SHEET").is_none();
+        mem.gpu_layers = self.sub.is_some();
         Win {
             id,
             window,
@@ -350,6 +376,7 @@ impl Shells {
             app_id: opts.app_id.clone(),
             alert_of: None,
             file_of: None,
+            tiles: HashMap::new(),
         }
     }
 }
@@ -594,8 +621,10 @@ pub fn run<A: App>(opts: WindowOptions, app: A) -> Result<(), Box<dyn std::error
     let shm = Shm::bind(&globals, &qh)?;
     let frac_mgr: Option<WpFractionalScaleManagerV1> = globals.bind(&qh, 1..=1, NoEvents).ok();
     let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, NoEvents).ok();
+    // GLOVE_NO_GPU_LAYERS=1: the scrolling layers copied into the window (the old way).
+    let sub = if viewporter.is_some() && std::env::var_os("GLOVE_NO_GPU_LAYERS").is_none() { SubcompositorState::bind(compositor.wl_compositor().clone(), &globals, &qh).ok() } else { None };
 
-    let shells = Shells { compositor, xdg, frac_mgr, viewporter };
+    let shells = Shells { compositor, xdg, frac_mgr, viewporter, sub };
     let first = shells.open(&qh, 0, &opts);
 
     // Recarrega o tema quando a configuração muda.
@@ -873,6 +902,91 @@ impl<A: App> Runner<A> {
                 self.app.window_closed(id);
                 self.exit = true;
             }
+        }
+    }
+
+    /// The tiles of the scrolling layers of this frame (`Ui::scroll_layer`), as surfaces
+    /// under the window: new ones are made, the ones that left go away, a tile painted again
+    /// is sent again, and each one is placed and cropped to the part that shows. Scrolling
+    /// only moves them: the GPU of the compositor does the rest. The window commits after,
+    /// and they all change together (synchronized subsurfaces).
+    fn sync_layers(&mut self) {
+        let places = std::mem::take(&mut self.w.mem.layer_out);
+        if places.is_empty() && self.w.tiles.is_empty() {
+            return;
+        }
+        let Some(subc) = &self.shells.sub else { return };
+        let Some(vp) = &self.shells.viewporter else { return };
+        let w = &mut self.w;
+        let pool = &mut self.pool;
+        let qh = &self.qh;
+        let parent = w.window.wl_surface().clone();
+        let fractional = w.viewport.is_some();
+        let (scale, int_scale) = (w.scale, w.int_scale.max(1));
+        let mut changed = false;
+        let before = w.tiles.len();
+        w.tiles.retain(|tid, _| places.iter().any(|p| p.tid == *tid));
+        changed |= w.tiles.len() != before;
+        for p in &places {
+            if !w.tiles.contains_key(&p.tid) {
+                let (sub, surface) = subc.create_subsurface(parent.clone(), qh);
+                sub.place_below(&parent);
+                // The window receives the mouse (the tiles are only a picture).
+                if let Ok(empty) = Region::new(&self.shells.compositor) {
+                    surface.set_input_region(Some(empty.wl_region()));
+                }
+                let viewport = vp.get_viewport(&surface, qh, NoEvents);
+                w.tiles.insert(p.tid, TileSurf { surface, sub, viewport, buffer: None, version: 0, place: None });
+            }
+            let Some(t) = w.tiles.get_mut(&p.tid) else { continue };
+            let Some(layer) = w.mem.layers.get(&p.tid) else { continue };
+            let (pw, ph) = (layer.canvas.px_width() as i32, layer.canvas.px_height() as i32);
+            let mut commit = false;
+            if t.version != p.version {
+                let Ok((buf, dst)) = pool.create_buffer(pw, ph, pw * 4, wl_shm::Format::Argb8888) else { continue };
+                // RGBA (tiny-skia) → BGRA (wl_shm Argb8888 em little-endian)
+                for (d, s) in dst.chunks_exact_mut(4).zip(layer.canvas.data().chunks_exact(4)) {
+                    d[0] = s[2];
+                    d[1] = s[1];
+                    d[2] = s[0];
+                    d[3] = s[3];
+                }
+                if buf.attach_to(&t.surface).is_err() {
+                    continue;
+                }
+                t.surface.damage_buffer(0, 0, pw, ph);
+                t.buffer = Some(buf);
+                t.version = p.version;
+                commit = true;
+            }
+            let place = (p.x.round() as i32, p.y.round() as i32, p.w.round() as i32, p.src_y, p.h_px);
+            if t.place != Some(place) || commit {
+                t.sub.set_position(place.0, place.1);
+                if fractional {
+                    // From the edges in pixels: each tile ends exactly where the next one
+                    // starts (rounding each height on its own left one-pixel gaps).
+                    let top = p.y as f64;
+                    let bottom = top + p.h_px as f64 / scale;
+                    let dh = (bottom.round() - top.round()) as i32;
+                    t.surface.set_buffer_scale(1);
+                    t.viewport.set_source(0.0, p.src_y as f64, pw as f64, p.h_px as f64);
+                    t.viewport.set_destination(place.2.max(1), dh.max(1));
+                } else {
+                    let k = int_scale as f64;
+                    t.surface.set_buffer_scale(int_scale);
+                    t.viewport.set_source(0.0, p.src_y as f64 / k, pw as f64 / k, p.h_px as f64 / k);
+                    t.viewport.set_destination(place.2.max(1), ((p.h_px as f64 / k).round() as i32).max(1));
+                }
+                t.place = Some(place);
+                commit = true;
+            }
+            if commit {
+                t.surface.commit();
+                changed = true;
+            }
+        }
+        if changed {
+            w.need_commit = true;
         }
     }
 
@@ -1521,6 +1635,7 @@ impl<A: App> Runner<A> {
         let mut resized = false;
         self.sync_alert_window();
         self.sync_file_window();
+        self.sync_layers();
         // O cursor que o quadro pediu (só manda quando muda, com o mouse sobre a janela).
         let want = self.w.mem.mouse_cursor;
         if self.w.input.inside && self.cursor_on != Some(want) {

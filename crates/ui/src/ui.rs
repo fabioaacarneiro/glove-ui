@@ -97,11 +97,25 @@ impl<'a> Column<'a> {
     }
 }
 
-/// A tile of a retained scrolling layer (`Ui::scroll_layer`): its canvas and the key of
-/// what it shows.
+/// A tile of a retained scrolling layer (`Ui::scroll_layer`): its canvas, the key of
+/// what it shows and a number that changes each time it is painted again.
 pub(crate) struct Layer {
-    canvas: Canvas,
+    pub(crate) canvas: Canvas,
     key: u64,
+    pub(crate) version: u64,
+}
+
+/// A visible tile in this frame (GPU layers): which one, its painting, where it goes (logical,
+/// in the window) and which pixel rows of it show.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LayerPlace {
+    pub tid: u64,
+    pub version: u64,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub src_y: i32,
+    pub h_px: i32,
 }
 
 /// Linha de uma tabela. `children`: `None` = folha, `Some(aberta)` = tem filhos
@@ -569,8 +583,16 @@ pub struct Memory {
     scratch_used: Vec<Id>,
     /// Retained scrolling layers (`scroll_layer`): the content painted once, taller than
     /// the view; scrolling inside it is a copy of a window of it, not a repaint.
-    layers: HashMap<Id, Layer>,
+    pub(crate) layers: HashMap<Id, Layer>,
     layers_used: Vec<Id>,
+    /// The platform shows the tiles itself, as surfaces under the window that the GPU
+    /// places (`wl_subsurface`): the window leaves a clear hole there and scrolling only
+    /// moves them (nothing is repainted nor sent). Off (the GTK backend): the tiles are
+    /// copied into the window.
+    pub(crate) gpu_layers: bool,
+    /// Where each visible tile goes in this frame (for the platform).
+    pub(crate) layer_out: Vec<LayerPlace>,
+    layer_gen: u64,
 }
 
 impl Memory {
@@ -701,6 +723,7 @@ impl<'a> Ui<'a> {
         let captured = captured || mem.alert_open;
         mem.alert_req = None;
         mem.file_want = None;
+        mem.layer_out.clear();
         mem.mouse_cursor = Cursor::Arrow;
         let mut ui = Self { c, theme, fonts, doc_fonts, resizable, input, mem, stack: Vec::new(), seed: 0, counter: 0, captured, disabled: false, sheet_blocked: false, clip_blocked: false, reserved: false, dimmed: false, redraw: false, close: false, hover_log: Default::default(), ptr_used: Default::default() };
         ui.stack.push(Layout { horizontal: false, x0: 0.0, y0: 0.0, cx: 0.0, cy: 0.0, width: w, used_w: 0.0, used_h: 0.0, spacing: 8.0 });
@@ -1426,6 +1449,12 @@ impl<'a> Ui<'a> {
         let first_needed = ((off_px / TILE_PX) as i64 - 1).max(0);
         let last_needed = (((off_px + view_px) / TILE_PX) as i64 + 1).min(last);
         let (x0, y0) = ((r.x * scale).round() as i32, (r.y * scale).round() as i32);
+        let gpu = self.mem.gpu_layers;
+        if gpu {
+            // The tiles go under the window: here, a clear hole (the same every frame, so
+            // scrolling changes nothing in the window itself).
+            self.c.clear_rect(r.x, r.y, r.w, r.h);
+        }
         for t in first_needed..=last_needed {
             let tid = id ^ (t as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
             self.mem.layers_used.push(tid);
@@ -1446,7 +1475,8 @@ impl<'a> Ui<'a> {
                     canvas.set_clip(None);
                     canvas.set_region(None);
                     draw(&mut canvas, self.fonts, top, h);
-                    Layer { canvas, key: tkey }
+                    self.mem.layer_gen += 1;
+                    Layer { canvas, key: tkey, version: self.mem.layer_gen }
                 }
             };
             // The visible part of this tile.
@@ -1455,7 +1485,11 @@ impl<'a> Ui<'a> {
             let b = (off_px + view_px).min(tile_top_px + tile.canvas.px_height() as i32);
             if b > a {
                 let dst_y = (y0 + (a - off_px)) as f32 / scale;
-                self.c.draw_layer_window(&tile.canvas, a - tile_top_px, b - a, x0 as f32 / scale, dst_y, tile.key);
+                if gpu {
+                    self.mem.layer_out.push(LayerPlace { tid, version: tile.version, x: x0 as f32 / scale, y: dst_y, w: r.w, src_y: a - tile_top_px, h_px: b - a });
+                } else {
+                    self.c.draw_layer_window(&tile.canvas, a - tile_top_px, b - a, x0 as f32 / scale, dst_y, tile.key);
+                }
             }
             self.mem.layers.insert(tid, tile);
         }
