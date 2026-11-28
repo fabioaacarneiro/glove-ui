@@ -97,6 +97,13 @@ impl<'a> Column<'a> {
     }
 }
 
+/// A tile of a retained scrolling layer (`Ui::scroll_layer`): its canvas and the key of
+/// what it shows.
+pub(crate) struct Layer {
+    canvas: Canvas,
+    key: u64,
+}
+
 /// Linha de uma tabela. `children`: `None` = folha, `Some(aberta)` = tem filhos
 /// (mostra o triângulo). `depth` é o nível na árvore (recuo).
 #[derive(Clone, Default)]
@@ -560,6 +567,10 @@ pub struct Memory {
     scratch: HashMap<Id, Canvas>,
     /// Quais foram usadas neste quadro (as outras são liberadas no fim).
     scratch_used: Vec<Id>,
+    /// Retained scrolling layers (`scroll_layer`): the content painted once, taller than
+    /// the view; scrolling inside it is a copy of a window of it, not a repaint.
+    layers: HashMap<Id, Layer>,
+    layers_used: Vec<Id>,
 }
 
 impl Memory {
@@ -1388,6 +1399,65 @@ impl<'a> Ui<'a> {
         self.c.end_sub(&mut sc, r.x, r.y);
         self.mem.scratch.insert(id, sc);
         self.mem.scratch_used.push(id);
+    }
+
+    /// A retained scrolling layer (PLANO, Fase 27): the content of `r`, scrolled by
+    /// `offset` in a content `content_h` tall, kept in tiles 256 pixels tall (the visible
+    /// ones and one more above and below). A tile is painted only when it first shows or
+    /// when `content_key(top, h)` (everything that decides the pixels of the content from
+    /// `top`, `h` tall) changes; a frame only copies the visible part of the tiles. While
+    /// scrolling, only the tile coming in is painted. `draw(canvas, fonts, top, h)` paints
+    /// the content from `top` on (content coordinates: y = row_y - top), opaque. The tiles
+    /// are also what the GPU will scroll by itself in a next step.
+    pub fn scroll_layer(&mut self, key: u64, r: Rect, offset: f32, content_h: f32, content_key: impl Fn(f32, f32) -> u64, mut draw: impl FnMut(&mut Canvas, &Fonts, f32, f32)) {
+        use std::hash::{Hash, Hasher};
+        const TILE_PX: i32 = 256;
+        let scale = self.c.scale;
+        let id = key ^ 0x5c70_11a7;
+        let dark = self.c.dark_remap;
+        let content_h = content_h.max(r.h).max(1.0);
+        // In pixels: the tiles join exactly (each one starts on a whole pixel of the content).
+        let tile_h = TILE_PX as f32 / scale;
+        let off_px = (offset * scale).round() as i32;
+        let view_px = (r.h * scale).round() as i32;
+        let total_px = (content_h * scale).round() as i32;
+        let last = ((total_px - 1).max(0) / TILE_PX) as i64;
+        let first_needed = ((off_px / TILE_PX) as i64 - 1).max(0);
+        let last_needed = (((off_px + view_px) / TILE_PX) as i64 + 1).min(last);
+        let (x0, y0) = ((r.x * scale).round() as i32, (r.y * scale).round() as i32);
+        for t in first_needed..=last_needed {
+            let tid = id ^ (t as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            self.mem.layers_used.push(tid);
+            let top = t as f32 * tile_h;
+            let h = tile_h.min(content_h - top).max(1.0 / scale);
+            let tkey = {
+                let mut k = std::collections::hash_map::DefaultHasher::new();
+                (content_key(top, h), r.w.to_bits(), h.to_bits(), scale.to_bits(), dark).hash(&mut k);
+                k.finish()
+            };
+            let old = self.mem.layers.remove(&tid);
+            let tile = match old {
+                Some(l) if l.key == tkey && l.canvas.w == r.w && l.canvas.h == h && l.canvas.scale == scale => l,
+                old => {
+                    let reuse = old.map(|l| l.canvas).filter(|c| c.w == r.w && c.h == h && c.scale == scale);
+                    let Some(mut canvas) = reuse.or_else(|| Canvas::new(r.w, h, scale)) else { continue };
+                    canvas.dark_remap = dark;
+                    canvas.set_clip(None);
+                    canvas.set_region(None);
+                    draw(&mut canvas, self.fonts, top, h);
+                    Layer { canvas, key: tkey }
+                }
+            };
+            // The visible part of this tile.
+            let tile_top_px = t as i32 * TILE_PX;
+            let a = off_px.max(tile_top_px);
+            let b = (off_px + view_px).min(tile_top_px + tile.canvas.px_height() as i32);
+            if b > a {
+                let dst_y = (y0 + (a - off_px)) as f32 / scale;
+                self.c.draw_layer_window(&tile.canvas, a - tile_top_px, b - a, x0 as f32 / scale, dst_y, tile.key);
+            }
+            self.mem.layers.insert(tid, tile);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3216,14 +3286,37 @@ impl<'a> Ui<'a> {
         }
         self.c.vline(body.x + body.w, hy + 1.0, hh - 2.0, sep);
 
-        // Corpo, desenhado numa superfície recortada.
+        // Corpo: numa camada retida (rolar dentro dela só copia o pedaço que aparece).
         let active = self.input.active;
         let off = state.scroll;
-        let fonts = self.fonts;
         let px = style.px;
         let zebra = style.zebra;
         let also = &style.also;
-        self.clipped(id, body, |c, _| {
+        let rows_in = |top: f32, h: f32| ((top / rh).floor().max(0.0) as usize, ((top + h) / rh).ceil() as usize + 1);
+        let content_key = |top: f32, h: f32| {
+            use std::hash::{Hash, Hasher};
+            let mut k = std::collections::hash_map::DefaultHasher::new();
+            (rh.to_bits(), px.to_bits(), zebra, modern, active, tree, selected, also, body.w.to_bits()).hash(&mut k);
+            let ac = a.to_color_u8();
+            (ac.red(), ac.green(), ac.blue()).hash(&mut k);
+            for x in &xs {
+                x.to_bits().hash(&mut k);
+            }
+            for c in cols {
+                c.right.hash(&mut k);
+            }
+            let (r0, r1) = rows_in(top, h);
+            (r0, rows.len()).hash(&mut k);
+            for row in rows.iter().skip(r0).take(r1.saturating_sub(r0)) {
+                (&row.cells, format!("{:?}", row.icon), row.depth, row.children, row.tint.map(|t| { let c = t.to_color_u8(); (c.red(), c.green(), c.blue(), c.alpha()) })).hash(&mut k);
+            }
+            k.finish()
+        };
+        self.scroll_layer(id, body, off, content.max(body.h), content_key, |c: &mut Canvas, fonts: &Fonts, top: f32, layer_h: f32| {
+            let off = top;
+            let (first, last) = rows_in(top, layer_h);
+            let count = last - first;
+            let body = Rect::new(body.x, body.y, body.w, layer_h);
             c.clear(Color::WHITE);
             if zebra {
                 // Listras também abaixo da última linha, como na era.
@@ -3674,6 +3767,8 @@ impl<'a> Ui<'a> {
         // Libera superfícies de recorte que não apareceram neste quadro.
         let used = std::mem::take(&mut self.mem.scratch_used);
         self.mem.scratch.retain(|k, _| used.contains(k));
+        let used = std::mem::take(&mut self.mem.layers_used);
+        self.mem.layers.retain(|k, _| used.contains(k));
         let usadas = std::mem::take(&mut self.mem.linhas_usadas);
         self.mem.linhas.retain(|k, _| usadas.contains(k));
         (self.redraw, self.close)

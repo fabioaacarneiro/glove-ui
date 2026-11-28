@@ -1156,7 +1156,7 @@ impl<A: App> Runner<A> {
             }
             if std::env::var_os("GLOVE_PROF").is_some() {
                 let px: i32 = damage.iter().map(|r| (r[2] - r[0]) * (r[3] - r[1])).sum();
-                eprintln!("PROF desenho={:?} envio={:?} passadas={} parcial={} mudou={}px em {} áreas", t1 - t0, t1.elapsed(), pass + 1, region.is_some(), px, damage.len());
+                eprintln!("PROF [{}] desenho={:?} envio={:?} passadas={} parcial={} mudou={}px em {} áreas", self.w.app_id, t1 - t0, t1.elapsed(), pass + 1, region.is_some(), px, damage.len());
             }
             // O que a animação pintou não está nas operações guardadas: o próximo
             // quadro anotado repinta essa área. Um quadro inteiro invalida tudo.
@@ -1343,7 +1343,8 @@ impl<A: App> Runner<A> {
             let px: i64 = rects.iter().map(|r| (r[2] - r[0]) as i64 * (r[3] - r[1]) as i64).sum();
             let sent: i32 = damage.iter().map(|r| (r[2] - r[0]) * (r[3] - r[1])).sum();
             eprintln!(
-                "PROF desenho={:?} (anotar={:?} ×{} pintar={:?} ×{}) envio={:?} pintou={}px de {} mudou={}px",
+                "PROF [{}] desenho={:?} (anotar={:?} ×{} pintar={:?} ×{}) envio={:?} pintou={}px de {} mudou={}px",
+                self.w.app_id,
                 t2 - t0,
                 t1 - t0,
                 passes,

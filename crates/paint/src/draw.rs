@@ -1463,6 +1463,42 @@ impl Canvas {
         }
     }
 
+    /// A window of a taller retained layer (`other`): its pixel rows from `src_y` on, as
+    /// tall as `h_px`, opaque, at (x, y). One operation with `key` for the whole window: a
+    /// scroll inside the layer is one copy, not a repaint of its content.
+    pub fn draw_layer_window(&mut self, other: &Canvas, src_y: i32, h_px: i32, x: f32, y: f32, key: u64) {
+        let s = self.scale;
+        let (ox, oy) = ((x * s).round() as i32, (y * s).round() as i32);
+        let (sw, sh) = (other.px_width() as i32, other.px_height() as i32);
+        let src_y = src_y.clamp(0, sh);
+        let h_px = h_px.min(sh - src_y);
+        if h_px <= 0 {
+            return;
+        }
+        if self.rec.is_some() {
+            let mut k = Fp::new(18);
+            k.rect([ox, oy, sw, h_px]);
+            k.u(src_y as u32 as u64);
+            k.u(key);
+            if self.note([ox, oy, ox + sw, oy + h_px], k.finish()) {
+                return;
+            }
+        }
+        let [bx0, by0, bx1, by1] = self.bounds();
+        let (x0, x1) = (ox.max(bx0), (ox + sw).min(bx1));
+        let (y0, y1) = (oy.max(by0), (oy + h_px).min(by1));
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let n = (x1 - x0) as usize * 4;
+        let src = other.data();
+        for yy in y0..y1 {
+            let si = ((yy - oy + src_y) as usize * sw as usize + (x0 - ox) as usize) * 4;
+            let di = self.idx(x0, yy);
+            self.pm.data_mut()[di..di + n].copy_from_slice(&src[si..si + n]);
+        }
+    }
+
     /// Compõe outro canvas com o canto em (ox, oy), em pixels (sem anotar).
     fn blit_canvas(&mut self, other: &Canvas, ox: i32, oy: i32) {
         let (sw, sh) = (other.px_width() as i32, other.px_height() as i32);
