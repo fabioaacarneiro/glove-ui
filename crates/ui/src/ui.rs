@@ -1402,16 +1402,17 @@ impl<'a> Ui<'a> {
     }
 
     /// A retained scrolling layer (PLANO, Fase 27): the content of `r`, scrolled by
-    /// `offset` in a content `content_h` tall, kept in tiles 256 pixels tall (the visible
+    /// `offset` in a content `content_h` tall, kept in tiles `tile_px` pixels tall (the visible
     /// ones and one more above and below). A tile is painted only when it first shows or
     /// when `content_key(top, h)` (everything that decides the pixels of the content from
     /// `top`, `h` tall) changes; a frame only copies the visible part of the tiles. While
     /// scrolling, only the tile coming in is painted. `draw(canvas, fonts, top, h)` paints
     /// the content from `top` on (content coordinates: y = row_y - top), opaque. The tiles
     /// are also what the GPU will scroll by itself in a next step.
-    pub fn scroll_layer(&mut self, key: u64, r: Rect, offset: f32, content_h: f32, content_key: impl Fn(f32, f32) -> u64, mut draw: impl FnMut(&mut Canvas, &Fonts, f32, f32)) {
+    pub fn scroll_layer(&mut self, key: u64, r: Rect, offset: f32, content_h: f32, tile_px: i32, content_key: impl Fn(f32, f32) -> u64, mut draw: impl FnMut(&mut Canvas, &Fonts, f32, f32)) {
         use std::hash::{Hash, Hasher};
-        const TILE_PX: i32 = 256;
+        #[allow(non_snake_case)]
+        let TILE_PX = tile_px.max(32);
         let scale = self.c.scale;
         let id = key ^ 0x5c70_11a7;
         let dark = self.c.dark_remap;
@@ -3312,7 +3313,7 @@ impl<'a> Ui<'a> {
             }
             k.finish()
         };
-        self.scroll_layer(id, body, off, content.max(body.h), content_key, |c: &mut Canvas, fonts: &Fonts, top: f32, layer_h: f32| {
+        self.scroll_layer(id, body, off, content.max(body.h), 256, content_key, |c: &mut Canvas, fonts: &Fonts, top: f32, layer_h: f32| {
             let off = top;
             let (first, last) = rows_in(top, layer_h);
             let count = last - first;
