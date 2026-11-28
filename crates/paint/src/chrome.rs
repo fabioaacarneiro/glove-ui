@@ -500,6 +500,29 @@ pub fn menu(fonts: &Fonts, theme: &Theme, items: &[MenuItem], hover: Option<usiz
     menu_min_w(fonts, theme, items, hover, scale, 0.0)
 }
 
+thread_local! {
+    /// The shadows of the menus, ready (blurring one took most of the time of drawing a
+    /// menu, and it was blurred again each time the mouse went to another item).
+    static MENU_SHADOWS: std::cell::RefCell<Vec<((u32, u32, u32, u32, u32), std::rc::Rc<Canvas>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The shadow of a menu `w` × `h` (with the margin `m`), from the cache of the last ones.
+fn menu_shadow(w: f32, h: f32, m: f32, s: &ShadowSpec, scale: f32) -> Option<std::rc::Rc<Canvas>> {
+    let key = (w.to_bits(), h.to_bits(), scale.to_bits(), s.radius.to_bits(), s.alpha.to_bits());
+    if let Some(c) = MENU_SHADOWS.with(|v| v.borrow().iter().find(|(k, _)| *k == key).map(|(_, c)| c.clone())) {
+        return Some(c);
+    }
+    let c = std::rc::Rc::new(Canvas::shadow(-m, 0.0, w + 2.0 * m, h + m, w, h, s, scale)?);
+    MENU_SHADOWS.with(|v| {
+        let mut v = v.borrow_mut();
+        if v.len() >= 12 {
+            v.remove(0);
+        }
+        v.push((key, c.clone()));
+    });
+    Some(c)
+}
+
 /// A menu at least `min_w` wide.
 fn menu_min_w(fonts: &Fonts, theme: &Theme, items: &[MenuItem], hover: Option<usize>, scale: f32, min_w: f32) -> Option<Canvas> {
     let (w, h) = menu_content_size(fonts, items);
@@ -512,7 +535,7 @@ fn menu_min_w(fonts: &Fonts, theme: &Theme, items: &[MenuItem], hover: Option<us
     let modern = theme.modern;
     let rad = if modern { 7.0 } else { 0.0 };
     let s = if modern { ShadowSpec { blur: 10.0, offset_y: 4.0, radius: rad, alpha: 0.32 } } else { ShadowSpec { blur: 8.0, offset_y: 4.0, radius: 0.0, alpha: 0.45 } };
-    if let Some(sh) = Canvas::shadow(-m, 0.0, w + 2.0 * m, h + m, w, h, &s, scale) {
+    if let Some(sh) = menu_shadow(w, h, m, &s, scale) {
         c.draw_canvas(&sh, 0.0, 0.0);
     }
     let x0 = m;
@@ -1886,7 +1909,7 @@ pub fn control_panel(theme: &Theme, fonts: &Fonts, info: &ControlInfo, scale: f3
     let mut c = Canvas::new(w + 2.0 * m, h + m, scale)?;
     let _style = PanelStyle::begin(&mut c);
     let s = ShadowSpec { blur: 10.0, offset_y: 4.0, radius: 10.0, alpha: 0.45 };
-    if let Some(sh) = Canvas::shadow(-m, 0.0, w + 2.0 * m, h + m, w, h, &s, scale) {
+    if let Some(sh) = menu_shadow(w, h, m, &s, scale) {
         c.draw_canvas(&sh, 0.0, 0.0);
     }
     let x0 = m;
@@ -2642,7 +2665,7 @@ pub fn quick_search(fonts: &Fonts, theme: &Theme, query: &str, caret: bool, rows
     let mut c = Canvas::new(w + 2.0 * m, h + m, scale)?;
     let _style = PanelStyle::begin(&mut c);
     let s = ShadowSpec { blur: 8.0, offset_y: 4.0, radius: 0.0, alpha: 0.45 };
-    if let Some(sh) = Canvas::shadow(-m, 0.0, w + 2.0 * m, h + m, w, h, &s, scale) {
+    if let Some(sh) = menu_shadow(w, h, m, &s, scale) {
         c.draw_canvas(&sh, 0.0, 0.0);
     }
     let x0 = m;
